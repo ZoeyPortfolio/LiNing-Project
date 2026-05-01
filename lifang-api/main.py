@@ -58,6 +58,53 @@ def load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df):
     return df
 
 
+# ==================== 固定聚类 ====================
+def perform_clustering(df, cluster_features):
+    """执行K-means聚类，固定3类，输出固定名称"""
+    # 标准化
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(df[cluster_features])
+    
+    # K=3 固定聚类
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+    df['客群类型'] = kmeans.fit_predict(X_scaled)
+    
+    # 根据聚类中心特征智能命名
+    # 计算各聚类中心的均值，用于判断类型
+    centers = scaler.inverse_transform(kmeans.cluster_centers_)
+    center_df = pd.DataFrame(centers, columns=cluster_features)
+    
+    # 判断逻辑：
+    # 类型0：省份分数高 + 工作人口多 → 一线城市标杆店
+    # 类型1：女性占比高 → 女性高消潜力店
+    # 类型2：年轻占比高 → 年轻潮流主力店
+    type_names = {}
+    
+    for cluster_id in range(3):
+        row = center_df.loc[cluster_id]
+        # 找出每个聚类的主要特征
+        if row['省份分数'] >= 3.5 and row['3公里工作人口'] > 300000:
+            type_names[cluster_id] = "一线城市标杆店"
+        elif row['女性占比'] > 0.5:
+            type_names[cluster_id] = "女性高消潜力店"
+        else:
+            type_names[cluster_id] = "年轻潮流主力店"
+    
+    # 如果还有未分配的，按顺序补充
+    assigned = set(type_names.values())
+    all_names = ["一线城市标杆店", "女性高消潜力店", "年轻潮流主力店"]
+    for name in all_names:
+        if name not in assigned:
+            for cluster_id in range(3):
+                if cluster_id not in type_names:
+                    type_names[cluster_id] = name
+                    break
+    
+    df['客群类型名称'] = df['客群类型'].map(type_names)
+    
+    return df, center_df
+
+
 # ==================== 端点1：聚类结果 ====================
 @app.post("/cluster-result")
 async def cluster_result(
@@ -67,8 +114,7 @@ async def cluster_result(
     gender_file: str = Form(...),
     asset_file: str = Form(...),
     sales_file: str = Form(...),
-    flash_mapping_file: str = Form(...),
-    n_clusters: int = Form(3)
+    flash_mapping_file: str = Form(...)
 ):
     try:
         population_df = download_file(population_file)
@@ -83,17 +129,13 @@ async def cluster_result(
         all_malls_df = df[['李宁商场名称', '城市', '省份'] + cluster_features].copy()
         all_malls_df = all_malls_df.dropna(subset=cluster_features)
         
-        scaler_all = StandardScaler()
-        X_scaled_all = scaler_all.fit_transform(all_malls_df[cluster_features])
-        kmeans_all = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        all_malls_df['客群类型'] = kmeans_all.fit_predict(X_scaled_all)
-        
-        name_mapping = {0: "一线城市标杆店", 1: "女性高消潜力店", 2: "年轻潮流主力店"}
-        all_malls_df['客群类型名称'] = all_malls_df['客群类型'].map(name_mapping)
+        # 固定聚类
+        all_malls_df, center_df = perform_clustering(all_malls_df, cluster_features)
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             all_malls_df.to_excel(writer, index=False, sheet_name='聚类结果')
+            center_df.to_excel(writer, index=True, sheet_name='聚类中心')
         output.seek(0)
         
         return StreamingResponse(
@@ -114,8 +156,7 @@ async def feature_means(
     gender_file: str = Form(...),
     asset_file: str = Form(...),
     sales_file: str = Form(...),
-    flash_mapping_file: str = Form(...),
-    n_clusters: int = Form(3)
+    flash_mapping_file: str = Form(...)
 ):
     try:
         population_df = download_file(population_file)
@@ -130,13 +171,8 @@ async def feature_means(
         all_malls_df = df[['李宁商场名称'] + cluster_features].copy()
         all_malls_df = all_malls_df.dropna(subset=cluster_features)
         
-        scaler_all = StandardScaler()
-        X_scaled_all = scaler_all.fit_transform(all_malls_df[cluster_features])
-        kmeans_all = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        all_malls_df['客群类型'] = kmeans_all.fit_predict(X_scaled_all)
-        
-        name_mapping = {0: "一线城市标杆店", 1: "女性高消潜力店", 2: "年轻潮流主力店"}
-        all_malls_df['客群类型名称'] = all_malls_df['客群类型'].map(name_mapping)
+        # 固定聚类
+        all_malls_df, center_df = perform_clustering(all_malls_df, cluster_features)
         
         mean_result = all_malls_df.groupby('客群类型名称')[cluster_features].mean().round(4)
         
@@ -148,7 +184,7 @@ async def feature_means(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==================== 端点3：系列占比预测 ====================
+# ==================== 端点3：系列占比预测（简化版）====================
 @app.post("/series-ratio")
 async def series_ratio(
     population_file: str = Form(...),
@@ -157,8 +193,7 @@ async def series_ratio(
     gender_file: str = Form(...),
     asset_file: str = Form(...),
     sales_file: str = Form(...),
-    flash_mapping_file: str = Form(...),
-    n_clusters: int = Form(3)
+    flash_mapping_file: str = Form(...)
 ):
     try:
         population_df = download_file(population_file)
@@ -170,7 +205,7 @@ async def series_ratio(
         
         df = load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df)
         
-        # 系列名称映射：原始名称 -> 标准化名称
+        # 系列名称映射
         series_mapping = {
             '李宁荣耀金标': '金标',
             '李宁荣耀': '荣耀',
@@ -179,27 +214,20 @@ async def series_ratio(
         }
         sales_detail['系列'] = sales_detail['系列'].map(series_mapping)
         
-        # 剔除推广类
         sales_detail_filtered = sales_detail[sales_detail['品类'] != '推广类'].copy()
         sales_detail_filtered = sales_detail_filtered[pd.notna(sales_detail_filtered['销售数量'])]
         sales_detail_filtered = sales_detail_filtered[sales_detail_filtered['销售数量'] > 0]
         
-        # 汇总
         summary = sales_detail_filtered.groupby(['店铺名称', '系列'])['销售数量'].sum().reset_index()
         total_by_store = summary.groupby('店铺名称')['销售数量'].sum().reset_index()
         total_by_store.columns = ['店铺名称', '总销售数量']
         summary = summary.merge(total_by_store, on='店铺名称')
         summary['销售占比'] = summary['销售数量'] / summary['总销售数量']
         
-        # 透视
         category_ratio_wide = summary.pivot_table(
-            index='店铺名称', 
-            columns='系列', 
-            values='销售占比', 
-            fill_value=0
+            index='店铺名称', columns='系列', values='销售占比', fill_value=0
         ).reset_index()
         
-        # 确保所有系列列都存在
         for s in ['金标', '荣耀', '国家队', '其他']:
             if s not in category_ratio_wide.columns:
                 category_ratio_wide[s] = 0
@@ -211,7 +239,6 @@ async def series_ratio(
             '其他': '其他Proportion'
         })
         
-        # 归一化
         ratio_cols = ['金标Proportion', '荣耀Proportion', '国家队Proportion', '其他Proportion']
         row_sum = category_ratio_wide[ratio_cols].sum(axis=1)
         for col in ratio_cols:
@@ -240,8 +267,7 @@ async def top20(
     gender_file: str = Form(...),
     asset_file: str = Form(...),
     sales_file: str = Form(...),
-    flash_mapping_file: str = Form(...),
-    n_clusters: int = Form(3)
+    flash_mapping_file: str = Form(...)
 ):
     try:
         population_df = download_file(population_file)
