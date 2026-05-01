@@ -1,11 +1,14 @@
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, HTTPException, Form
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse, FileResponse
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
 import warnings
 import io
+import tempfile
+import os
 import requests
 
 warnings.filterwarnings('ignore')
@@ -58,46 +61,13 @@ def load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df):
     return df
 
 
-@app.post("/top20")
-async def top20(
-    population_file: str = Form(...),
-    phone_file: str = Form(...),
-    age_file: str = Form(...),
-    gender_file: str = Form(...),
-    asset_file: str = Form(...),
-    sales_file: str = Form(...),
-    flash_mapping_file: str = Form(...),
-    n_clusters: int = Form(3)
-):
-    try:
-        # 下载文件
-        population_df = download_file(population_file)
-        phone_df = download_file(phone_file)
-        age_df = download_file(age_file)
-        gender_df = download_file(gender_file)
-        asset_df = download_file(asset_file)
-        
-        df = load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df)
-        
-        tier1_cities = ['上海市', '北京市', '深圳市', '广州市']
-        new_tier1_cities = ['成都市', '杭州市', '重庆市', '武汉市', '苏州市', '西安市', '南京市', 
-                             '长沙市', '郑州市', '天津市', '合肥市', '青岛市', '东莞市', '宁波市']
-        
-        df_filtered = df[df['城市'].isin(tier1_cities + new_tier1_cities)]
-        top20_result = df_filtered.nlargest(20, '高消费力')[['李宁商场名称', '城市', '年轻占比', '女性占比', '高消费力', '3公里工作人口', '省份分数']]
-        
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            top20_result.to_excel(writer, index=False, sheet_name='TOP20')
-        output.seek(0)
-        
-        return StreamingResponse(
-            output, 
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=top20.xlsx"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def save_to_temp_file(data: bytes, filename: str) -> str:
+    """保存二进制数据到临时文件，返回文件路径"""
+    temp_dir = tempfile.gettempdir()
+    file_path = os.path.join(temp_dir, filename)
+    with open(file_path, 'wb') as f:
+        f.write(data)
+    return file_path
 
 
 @app.post("/cluster-result")
@@ -137,10 +107,12 @@ async def cluster_result(
             all_malls_df.to_excel(writer, index=False, sheet_name='聚类结果')
         output.seek(0)
         
-        return StreamingResponse(
-            output, 
+        temp_path = save_to_temp_file(output.getvalue(), "cluster_result.xlsx")
+        
+        return FileResponse(
+            temp_path,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=cluster_result.xlsx"}
+            filename="cluster_result.xlsx"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -178,9 +150,13 @@ async def feature_means(
         name_mapping = {0: "一线城市标杆店", 1: "女性高消潜力店", 2: "年轻潮流主力店"}
         all_malls_df['客群类型名称'] = all_malls_df['客群类型'].map(name_mapping)
         
-        mean_result = all_malls_df.groupby('客群类型名称')[cluster_features].mean().round(2)
+        mean_result = all_malls_df.groupby('客群类型名称')[cluster_features].mean().round(4)
         
-        return JSONResponse(content=mean_result.to_dict())
+        # 返回 JSON 表格（特征均值比较小，用 JSON 更方便）
+        return JSONResponse(content={
+            "status": "success",
+            "data": mean_result.to_dict()
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -231,10 +207,55 @@ async def series_ratio(
             category_ratio_wide.to_excel(writer, index=False, sheet_name='系列占比')
         output.seek(0)
         
-        return StreamingResponse(
-            output, 
+        temp_path = save_to_temp_file(output.getvalue(), "series_ratio.xlsx")
+        
+        return FileResponse(
+            temp_path,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=series_ratio.xlsx"}
+            filename="series_ratio.xlsx"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/top20")
+async def top20(
+    population_file: str = Form(...),
+    phone_file: str = Form(...),
+    age_file: str = Form(...),
+    gender_file: str = Form(...),
+    asset_file: str = Form(...),
+    sales_file: str = Form(...),
+    flash_mapping_file: str = Form(...),
+    n_clusters: int = Form(3)
+):
+    try:
+        population_df = download_file(population_file)
+        phone_df = download_file(phone_file)
+        age_df = download_file(age_file)
+        gender_df = download_file(gender_file)
+        asset_df = download_file(asset_file)
+        
+        df = load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df)
+        
+        tier1_cities = ['上海市', '北京市', '深圳市', '广州市']
+        new_tier1_cities = ['成都市', '杭州市', '重庆市', '武汉市', '苏州市', '西安市', '南京市', 
+                             '长沙市', '郑州市', '天津市', '合肥市', '青岛市', '东莞市', '宁波市']
+        
+        df_filtered = df[df['城市'].isin(tier1_cities + new_tier1_cities)]
+        top20_result = df_filtered.nlargest(20, '高消费力')[['李宁商场名称', '城市', '年轻占比', '女性占比', '高消费力', '3公里工作人口', '省份分数']]
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            top20_result.to_excel(writer, index=False, sheet_name='TOP20')
+        output.seek(0)
+        
+        temp_path = save_to_temp_file(output.getvalue(), "top20.xlsx")
+        
+        return FileResponse(
+            temp_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename="top20.xlsx"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
