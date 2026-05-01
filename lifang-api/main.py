@@ -1,14 +1,12 @@
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Form
 from fastapi.responses import JSONResponse, StreamingResponse
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor
 import warnings
 import io
-import tempfile
-import shutil
+import requests
 
 warnings.filterwarnings('ignore')
 
@@ -17,7 +15,13 @@ app = FastAPI(title="李宁快闪店分析API")
 train_features = ['年轻占比', '女性占比', '高消费力', '3公里工作人口', '省份分数']
 target_cols = ['金标Proportion', '荣耀Proportion', '国家队Proportion', '其他Proportion']
 
-# ==================== 公共函数 ====================
+
+def download_file(url: str) -> pd.DataFrame:
+    """从URL下载Excel文件并返回DataFrame"""
+    response = requests.get(url)
+    response.raise_for_status()
+    return pd.read_excel(io.BytesIO(response.content))
+
 
 def load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df):
     phone_columns = ['赢商项目ID'] + ['APPLE', 'HUAWEI', 'SAMSUNG']
@@ -53,26 +57,66 @@ def load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df):
     df['省份分数'] = df['省份'].map(province_score)
     return df
 
-# ==================== 端点1：聚类结果 ====================
+
+@app.post("/top20")
+async def top20(
+    population_file: str = Form(...),
+    phone_file: str = Form(...),
+    age_file: str = Form(...),
+    gender_file: str = Form(...),
+    asset_file: str = Form(...),
+    sales_file: str = Form(...),
+    flash_mapping_file: str = Form(...),
+    n_clusters: int = Form(3)
+):
+    try:
+        # 下载文件
+        population_df = download_file(population_file)
+        phone_df = download_file(phone_file)
+        age_df = download_file(age_file)
+        gender_df = download_file(gender_file)
+        asset_df = download_file(asset_file)
+        
+        df = load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df)
+        
+        tier1_cities = ['上海市', '北京市', '深圳市', '广州市']
+        new_tier1_cities = ['成都市', '杭州市', '重庆市', '武汉市', '苏州市', '西安市', '南京市', 
+                             '长沙市', '郑州市', '天津市', '合肥市', '青岛市', '东莞市', '宁波市']
+        
+        df_filtered = df[df['城市'].isin(tier1_cities + new_tier1_cities)]
+        top20_result = df_filtered.nlargest(20, '高消费力')[['李宁商场名称', '城市', '年轻占比', '女性占比', '高消费力', '3公里工作人口', '省份分数']]
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            top20_result.to_excel(writer, index=False, sheet_name='TOP20')
+        output.seek(0)
+        
+        return StreamingResponse(
+            output, 
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=top20.xlsx"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/cluster-result")
 async def cluster_result(
-    population_file: UploadFile = File(...),
-    phone_file: UploadFile = File(...),
-    age_file: UploadFile = File(...),
-    gender_file: UploadFile = File(...),
-    asset_file: UploadFile = File(...),
-    sales_file: UploadFile = File(...),
-    flash_mapping_file: UploadFile = File(...),
+    population_file: str = Form(...),
+    phone_file: str = Form(...),
+    age_file: str = Form(...),
+    gender_file: str = Form(...),
+    asset_file: str = Form(...),
+    sales_file: str = Form(...),
+    flash_mapping_file: str = Form(...),
     n_clusters: int = Form(3)
 ):
-    temp_dir = tempfile.mkdtemp()
     try:
-        population_df = pd.read_excel(io.BytesIO(await population_file.read()))
-        phone_df = pd.read_excel(io.BytesIO(await phone_file.read()))
-        age_df = pd.read_excel(io.BytesIO(await age_file.read()))
-        gender_df = pd.read_excel(io.BytesIO(await gender_file.read()))
-        asset_df = pd.read_excel(io.BytesIO(await asset_file.read()))
+        population_df = download_file(population_file)
+        phone_df = download_file(phone_file)
+        age_df = download_file(age_file)
+        gender_df = download_file(gender_file)
+        asset_df = download_file(asset_file)
         
         df = load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df)
         
@@ -93,32 +137,32 @@ async def cluster_result(
             all_malls_df.to_excel(writer, index=False, sheet_name='聚类结果')
         output.seek(0)
         
-        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=cluster_result.xlsx"})
+        return StreamingResponse(
+            output, 
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=cluster_result.xlsx"}
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
-# ==================== 端点2：特征均值 ====================
 
 @app.post("/feature-means")
 async def feature_means(
-    population_file: UploadFile = File(...),
-    phone_file: UploadFile = File(...),
-    age_file: UploadFile = File(...),
-    gender_file: UploadFile = File(...),
-    asset_file: UploadFile = File(...),
-    sales_file: UploadFile = File(...),
-    flash_mapping_file: UploadFile = File(...),
+    population_file: str = Form(...),
+    phone_file: str = Form(...),
+    age_file: str = Form(...),
+    gender_file: str = Form(...),
+    asset_file: str = Form(...),
+    sales_file: str = Form(...),
+    flash_mapping_file: str = Form(...),
     n_clusters: int = Form(3)
 ):
-    temp_dir = tempfile.mkdtemp()
     try:
-        population_df = pd.read_excel(io.BytesIO(await population_file.read()))
-        phone_df = pd.read_excel(io.BytesIO(await phone_file.read()))
-        age_df = pd.read_excel(io.BytesIO(await age_file.read()))
-        gender_df = pd.read_excel(io.BytesIO(await gender_file.read()))
-        asset_df = pd.read_excel(io.BytesIO(await asset_file.read()))
+        population_df = download_file(population_file)
+        phone_df = download_file(phone_file)
+        age_df = download_file(age_file)
+        gender_df = download_file(gender_file)
+        asset_df = download_file(asset_file)
         
         df = load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df)
         
@@ -139,35 +183,29 @@ async def feature_means(
         return JSONResponse(content=mean_result.to_dict())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
-# ==================== 端点3：系列占比预测 ====================
 
 @app.post("/series-ratio")
 async def series_ratio(
-    population_file: UploadFile = File(...),
-    phone_file: UploadFile = File(...),
-    age_file: UploadFile = File(...),
-    gender_file: UploadFile = File(...),
-    asset_file: UploadFile = File(...),
-    sales_file: UploadFile = File(...),
-    flash_mapping_file: UploadFile = File(...),
+    population_file: str = Form(...),
+    phone_file: str = Form(...),
+    age_file: str = Form(...),
+    gender_file: str = Form(...),
+    asset_file: str = Form(...),
+    sales_file: str = Form(...),
+    flash_mapping_file: str = Form(...),
     n_clusters: int = Form(3)
 ):
-    temp_dir = tempfile.mkdtemp()
     try:
-        population_df = pd.read_excel(io.BytesIO(await population_file.read()))
-        phone_df = pd.read_excel(io.BytesIO(await phone_file.read()))
-        age_df = pd.read_excel(io.BytesIO(await age_file.read()))
-        gender_df = pd.read_excel(io.BytesIO(await gender_file.read()))
-        asset_df = pd.read_excel(io.BytesIO(await asset_file.read()))
-        sales_detail = pd.read_excel(io.BytesIO(await sales_file.read()))
-        flash_mapping = pd.read_excel(io.BytesIO(await flash_mapping_file.read()))
+        population_df = download_file(population_file)
+        phone_df = download_file(phone_file)
+        age_df = download_file(age_file)
+        gender_df = download_file(gender_file)
+        asset_df = download_file(asset_file)
+        sales_detail = download_file(sales_file)
         
         df = load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df)
         
-        # 系列占比计算
         series_mapping = {'李宁荣耀金标': '金标', '李宁荣耀': '荣耀', '国家队': '国家队', '其他系列': '其他'}
         sales_detail['系列'] = sales_detail['系列'].map(series_mapping)
         sales_detail_filtered = sales_detail[sales_detail['品类'] != '推广类'].copy()
@@ -193,61 +231,19 @@ async def series_ratio(
             category_ratio_wide.to_excel(writer, index=False, sheet_name='系列占比')
         output.seek(0)
         
-        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=series_ratio.xlsx"})
+        return StreamingResponse(
+            output, 
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=series_ratio.xlsx"}
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
-# ==================== 端点4：TOP20 ====================
-
-@app.post("/top20")
-async def top20(
-    population_file: UploadFile = File(...),
-    phone_file: UploadFile = File(...),
-    age_file: UploadFile = File(...),
-    gender_file: UploadFile = File(...),
-    asset_file: UploadFile = File(...),
-    sales_file: UploadFile = File(...),
-    flash_mapping_file: UploadFile = File(...),
-    n_clusters: int = Form(3)
-):
-    temp_dir = tempfile.mkdtemp()
-    try:
-        population_df = pd.read_excel(io.BytesIO(await population_file.read()))
-        phone_df = pd.read_excel(io.BytesIO(await phone_file.read()))
-        age_df = pd.read_excel(io.BytesIO(await age_file.read()))
-        gender_df = pd.read_excel(io.BytesIO(await gender_file.read()))
-        asset_df = pd.read_excel(io.BytesIO(await asset_file.read()))
-        sales_detail = pd.read_excel(io.BytesIO(await sales_file.read()))
-        flash_mapping = pd.read_excel(io.BytesIO(await flash_mapping_file.read()))
-        
-        df = load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df)
-        
-        # 简化版：返回TOP20
-        tier1_cities = ['上海市', '北京市', '深圳市', '广州市']
-        new_tier1_cities = ['成都市', '杭州市', '重庆市', '武汉市', '苏州市', '西安市', '南京市', 
-                             '长沙市', '郑州市', '天津市', '合肥市', '青岛市', '东莞市', '宁波市']
-        
-        df_filtered = df[df['城市'].isin(tier1_cities + new_tier1_cities)]
-        top20_result = df_filtered.nlargest(20, '高消费力')[['李宁商场名称', '城市', '年轻占比', '女性占比', '高消费力', '3公里工作人口']]
-        
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            top20_result.to_excel(writer, index=False, sheet_name='TOP20')
-        output.seek(0)
-        
-        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=top20.xlsx"})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-# ==================== 健康检查 ====================
 
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
 
 if __name__ == "__main__":
     import uvicorn
