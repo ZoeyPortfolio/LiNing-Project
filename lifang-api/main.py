@@ -1,14 +1,11 @@
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, HTTPException, Form
+from fastapi.responses import StreamingResponse, JSONResponse
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor
 import warnings
 import io
-import tempfile
-import os
 import requests
 
 warnings.filterwarnings('ignore')
@@ -61,15 +58,7 @@ def load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df):
     return df
 
 
-def save_to_temp_file(data: bytes, filename: str) -> str:
-    """保存二进制数据到临时文件，返回文件路径"""
-    temp_dir = tempfile.gettempdir()
-    file_path = os.path.join(temp_dir, filename)
-    with open(file_path, 'wb') as f:
-        f.write(data)
-    return file_path
-
-
+# ==================== 端点1：聚类结果 ====================
 @app.post("/cluster-result")
 async def cluster_result(
     population_file: str = Form(...),
@@ -107,17 +96,16 @@ async def cluster_result(
             all_malls_df.to_excel(writer, index=False, sheet_name='聚类结果')
         output.seek(0)
         
-        temp_path = save_to_temp_file(output.getvalue(), "cluster_result.xlsx")
-        
-        return FileResponse(
-            temp_path,
+        return StreamingResponse(
+            output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename="cluster_result.xlsx"
+            headers={"Content-Disposition": "attachment; filename=cluster_result.xlsx"}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== 端点2：特征均值 ====================
 @app.post("/feature-means")
 async def feature_means(
     population_file: str = Form(...),
@@ -152,7 +140,6 @@ async def feature_means(
         
         mean_result = all_malls_df.groupby('客群类型名称')[cluster_features].mean().round(4)
         
-        # 返回 JSON 表格（特征均值比较小，用 JSON 更方便）
         return JSONResponse(content={
             "status": "success",
             "data": mean_result.to_dict()
@@ -161,6 +148,7 @@ async def feature_means(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== 端点3：系列占比预测 ====================
 @app.post("/series-ratio")
 async def series_ratio(
     population_file: str = Form(...),
@@ -182,21 +170,48 @@ async def series_ratio(
         
         df = load_and_merge_data(population_df, phone_df, age_df, gender_df, asset_df)
         
-        series_mapping = {'李宁荣耀金标': '金标', '李宁荣耀': '荣耀', '国家队': '国家队', '其他系列': '其他'}
+        # 系列名称映射：原始名称 -> 标准化名称
+        series_mapping = {
+            '李宁荣耀金标': '金标',
+            '李宁荣耀': '荣耀',
+            '国家队': '国家队',
+            '其他系列': '其他'
+        }
         sales_detail['系列'] = sales_detail['系列'].map(series_mapping)
+        
+        # 剔除推广类
         sales_detail_filtered = sales_detail[sales_detail['品类'] != '推广类'].copy()
         sales_detail_filtered = sales_detail_filtered[pd.notna(sales_detail_filtered['销售数量'])]
         sales_detail_filtered = sales_detail_filtered[sales_detail_filtered['销售数量'] > 0]
         
+        # 汇总
         summary = sales_detail_filtered.groupby(['店铺名称', '系列'])['销售数量'].sum().reset_index()
         total_by_store = summary.groupby('店铺名称')['销售数量'].sum().reset_index()
         total_by_store.columns = ['店铺名称', '总销售数量']
         summary = summary.merge(total_by_store, on='店铺名称')
         summary['销售占比'] = summary['销售数量'] / summary['总销售数量']
         
-        category_ratio_wide = summary.pivot_table(index='店铺名称', columns='系列', values='销售占比', fill_value=0).reset_index()
-        category_ratio_wide = category_ratio_wide.rename(columns={'金标': '金标Proportion', '荣耀': '荣耀Proportion', '国家队': '国家队Proportion', '其他': '其他Proportion'})
+        # 透视
+        category_ratio_wide = summary.pivot_table(
+            index='店铺名称', 
+            columns='系列', 
+            values='销售占比', 
+            fill_value=0
+        ).reset_index()
         
+        # 确保所有系列列都存在
+        for s in ['金标', '荣耀', '国家队', '其他']:
+            if s not in category_ratio_wide.columns:
+                category_ratio_wide[s] = 0
+        
+        category_ratio_wide = category_ratio_wide.rename(columns={
+            '金标': '金标Proportion',
+            '荣耀': '荣耀Proportion',
+            '国家队': '国家队Proportion',
+            '其他': '其他Proportion'
+        })
+        
+        # 归一化
         ratio_cols = ['金标Proportion', '荣耀Proportion', '国家队Proportion', '其他Proportion']
         row_sum = category_ratio_wide[ratio_cols].sum(axis=1)
         for col in ratio_cols:
@@ -207,17 +222,16 @@ async def series_ratio(
             category_ratio_wide.to_excel(writer, index=False, sheet_name='系列占比')
         output.seek(0)
         
-        temp_path = save_to_temp_file(output.getvalue(), "series_ratio.xlsx")
-        
-        return FileResponse(
-            temp_path,
+        return StreamingResponse(
+            output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename="series_ratio.xlsx"
+            headers={"Content-Disposition": "attachment; filename=series_ratio.xlsx"}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== 端点4：TOP20 ====================
 @app.post("/top20")
 async def top20(
     population_file: str = Form(...),
@@ -250,17 +264,16 @@ async def top20(
             top20_result.to_excel(writer, index=False, sheet_name='TOP20')
         output.seek(0)
         
-        temp_path = save_to_temp_file(output.getvalue(), "top20.xlsx")
-        
-        return FileResponse(
-            temp_path,
+        return StreamingResponse(
+            output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename="top20.xlsx"
+            headers={"Content-Disposition": "attachment; filename=top20.xlsx"}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== 健康检查 ====================
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
